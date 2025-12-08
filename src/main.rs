@@ -119,8 +119,11 @@ fn main() -> std::io::Result<()> {
         let args: Vec<String> = env::args().collect();
         
         // Only run in legacy command mode if we have old-style arguments
+        // Only drop into legacy mode if the first arg is NOT a known subcommand.
+        // Include the newer subcommands so they are handled by clap.
         if args.len() >= 2 && !args[1].starts_with("-") && 
-            !["benchmark", "estimate", "generate", "serve", "help"].contains(&args[1].to_lowercase().as_str()) {
+            !["benchmark", "estimate", "generate", "generate-prefix-suffix", "multi-prefix", "serve", "help"]
+                .contains(&args[1].to_lowercase().as_str()) {
             return run_legacy_mode(args);
         }
         
