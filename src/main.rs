@@ -576,12 +576,10 @@ fn run_generate_prefix_suffix_command(prefix: &str, suffix: &str, case_sensitive
                     // Use combined mode
                     let vanity_mode = VanityMode::PrefixAndSuffix(prefix.to_string(), suffix.to_string());
                     
-                    // Dummy pattern for interface compatibility
-                    let combined_pattern = format!("{}...{}", prefix, suffix);
-                    
+                    // Pass prefix as the primary pattern (suffix handled separately in combined mode)
                     let search_result = generate_vanity_address(
                         &device,
-                        &combined_pattern,
+                        prefix,
                         vanity_mode,
                         case_sensitive,
                         batch_size,

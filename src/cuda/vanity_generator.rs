@@ -131,10 +131,17 @@ pub fn generate_vanity_address_with_updates(
         Ok(())
     };
     
-    validate_pattern(pattern)?;
+    // Validate prefix/suffix separately in combined mode
+    if use_combined_mode {
+        validate_pattern(&prefix_pattern)?;
+        validate_pattern(&suffix_pattern)?;
+    } else {
+        validate_pattern(pattern)?;
+    }
 
-    // Convert pattern to CString for passing to kernel
-    let pattern_cstring = match CString::new(pattern) {
+    // Convert pattern to CString for passing to kernel (prefix when combined)
+    let pattern_str_for_kernel = if use_combined_mode { prefix_pattern.as_str() } else { pattern };
+    let pattern_cstring = match CString::new(pattern_str_for_kernel) {
         Ok(cs) => cs,
         Err(_) => return Err(CudaError::Other("Invalid pattern string".to_string())),
     };
