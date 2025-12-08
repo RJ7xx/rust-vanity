@@ -141,10 +141,10 @@ fn main() -> std::io::Result<()> {
                 run_generate_command(&pattern, suffix, !no_case_sensitive, max_attempts);
             },
             Some(Commands::GeneratePrefixSuffix { prefix, suffix, no_case_sensitive, max_attempts }) => {
-                run_generate_prefix_suffix_command(&prefix, &suffix, !no_case_sensitive, max_attempts);
+                run_generate_prefix_suffix_command(&prefix, &suffix, no_case_sensitive, max_attempts);
             },
             Some(Commands::MultiPrefix { prefixes, suffix, no_case_sensitive, webhook, max_attempts }) => {
-                run_multi_prefix_command(&prefixes, &suffix, !no_case_sensitive, webhook, max_attempts);
+                run_multi_prefix_command(&prefixes, &suffix, no_case_sensitive, webhook, max_attempts);
             },
             Some(Commands::Serve { host, port, allowed_origins }) => {
                 let allowed_origins: Vec<String> = allowed_origins.split(',')
