@@ -130,7 +130,15 @@ pub fn generate_vanity_address_with_updates(
         }
         Ok(())
     };
-    
+
+    // Determine if we're searching by prefix, suffix, or both
+    let (is_prefix, use_combined_mode, prefix_pattern, suffix_pattern) = match &mode {
+        VanityMode::Prefix => (true, false, pattern.to_string(), String::new()),
+        VanityMode::Suffix => (false, false, String::new(), pattern.to_string()),
+        VanityMode::PrefixAndSuffix(prefix, suffix) => (true, true, prefix.clone(), suffix.clone()),
+        _ => return Err(CudaError::Other("Only prefix, suffix, and prefix+suffix modes are currently supported".to_string())),
+    };
+
     // Validate prefix/suffix separately in combined mode
     if use_combined_mode {
         validate_pattern(&prefix_pattern)?;
@@ -144,14 +152,6 @@ pub fn generate_vanity_address_with_updates(
     let pattern_cstring = match CString::new(pattern_str_for_kernel) {
         Ok(cs) => cs,
         Err(_) => return Err(CudaError::Other("Invalid pattern string".to_string())),
-    };
-
-    // Determine if we're searching by prefix, suffix, or both
-    let (is_prefix, use_combined_mode, prefix_pattern, suffix_pattern) = match &mode {
-        VanityMode::Prefix => (true, false, pattern.to_string(), String::new()),
-        VanityMode::Suffix => (false, false, String::new(), pattern.to_string()),
-        VanityMode::PrefixAndSuffix(prefix, suffix) => (true, true, prefix.clone(), suffix.clone()),
-        _ => return Err(CudaError::Other("Only prefix, suffix, and prefix+suffix modes are currently supported".to_string())),
     };
 
     // Allocate device memory for various data structures
