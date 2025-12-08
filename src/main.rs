@@ -654,7 +654,7 @@ fn run_multi_prefix_command(prefixes: &str, suffix: &str, case_sensitive: bool, 
     println!("Searching for {} with suffix {}", 
              prefix_list.join(", ").bright_green().bold(),
              suffix.bright_green().bold());
-    println!("Case-sensitive: {}\n", !case_sensitive);
+    println!("Case-sensitive: {}\n", case_sensitive);
     
     // Search for each prefix in sequence
     for prefix in prefix_list {
