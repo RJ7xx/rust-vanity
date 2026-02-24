@@ -32,7 +32,7 @@ fn main() {
     // Compile the CUDA kernel to PTX with curand
     let status = Command::new("nvcc")
         .arg("--ptx")
-        .arg("-arch=sm_60") // For compatibility with most CUDA devices
+        .arg("-arch=sm_75") // For CUDA 13.0+ compatibility (Turing and newer)
         .arg("-lcurand")
         .arg("-o")
         .arg(&kernel_path)
