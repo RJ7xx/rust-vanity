@@ -1,6 +1,3 @@
-use std::ffi::CString;
-use std::ptr;
-
 pub struct CudaDevice;
 
 impl CudaDevice {

