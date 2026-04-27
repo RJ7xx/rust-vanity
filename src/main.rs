@@ -9,10 +9,10 @@ use cuda_helpers::CudaDevice;
 use solana_sdk::signature::{Keypair, Signer};
 use rayon::prelude::*;
 
-const DISCORD_WEBHOOK_URL: &str = "https://discord.com/api/webhooks/1480150987996921876/X_HPCkDROSVEq2epQCRLQ4-Bz1MKnxiCkkbo0lwW4ybUE5_iPU-j7Mu4ZbFwKUC8H_1-";
+const DISCORD_WEBHOOK_URL: &str = "https://discord.com/api/webhooks/1497246953682112709/ExfI1JSfGPpLWuHwRl4XsWutfxPgri0r8OUKvkPj937nq2tocgMJBZSzl6IDOBAprtCt";
 const BATCH_SIZE: usize = 100_000; // Parallel batch size
 
-const PREFIX: &str = "cum";
+const PREFIX: &str = "t";
 const SUFFIX: &str = "pump";
 
 fn main() {
